@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Gurobi generated files (committed separately for submission)
+model.lp
+gurobi.log
+
+# Solver results (generated on run)
+results/
+
+# Large data files — GloVe embeddings (too big for git)
+data/*.txt
+data/glove.*
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.fls
+*.fdb_latexmk
+*.blg
+*.bbl
+
+# OS
+.DS_Store
+Thumbs.db
