@@ -1,5 +1,4 @@
-# Set Covering Mathematical Optimization
-### Maximum Coverage of Semantic Word Space
+# Frequency-Weighted p-Median on Semantic Word Space
 
 > **EMÜ414 – Mathematical Programming and Computer Applications**
 > Hacettepe University, Department of Industrial Engineering | Spring 2025–2026
@@ -8,68 +7,69 @@
 
 ## Problem Description
 
-This project applies a **Maximum Coverage Problem (MCP)** — a variant of the classical Set Covering problem — to the semantic space of natural language words.
+We model vocabulary selection as a **Frequency-Weighted p-Median Problem (FWPMP)** over a semantic word space.
 
 **Setup:**
-- We take the **top 10,000 most frequent English words** and select a subset of **100 words** as our universe.
-- We compute a **100×100 semantic distance matrix** using pre-trained **GloVe / Word2Vec embeddings** (cosine distance).
-- Given a fixed **budget B** (number of words we are allowed to select as "representatives"), we find which words to select so that the maximum number of words are **covered** — i.e., within a distance threshold `r` of at least one selected word.
+- Take the **top 10,000 most frequent English words** (`data/pop10000.xlsx`), select a stratified subset of **100 words**.
+- Compute a **100×100 semantic distance matrix** using pre-trained **GloVe embeddings** (cosine distance).
+- Each word has a **frequency weight** `F_w = 1/rank` (more frequent = higher weight).
+- Given a fixed **budget B**, select at most B "representative" words and assign every other word to exactly one representative.
+- **Goal:** minimise the total frequency-weighted semantic distance between every word and its assigned representative.
 
-**Intuition:** Think of it as placing B "facility words" in semantic space such that as many of the 100 words as possible have a semantically similar representative nearby.
+**Intuition:** The distance matrix `D` enters the objective directly — the model finds the B words that best represent the full vocabulary, where popular words are penalised more if placed far from a representative.
 
 ---
 
 ## Mathematical Formulation
 
-### Sets
-| Symbol | Description |
-|--------|-------------|
-| `W = {1, ..., 100}` | Set of all word indices |
-| `N(j) = {i ∈ W : d[i][j] ≤ r}` | Neighborhood of word j (words that can cover j) |
+### Sets & Parameters
 
-### Parameters
 | Symbol | Description |
 |--------|-------------|
-| `d[i][j]` | Cosine distance between word i and word j |
-| `r` | Coverage radius (distance threshold) |
-| `B` | Budget — maximum number of words to select |
+| `W = {1, …, 100}` | Set of all word indices |
+| `D[w][v] ∈ [0, 2]` | Cosine distance between word w and word v (GloVe) |
+| `F_w ∈ [0, 1]` | Normalised frequency weight of word w (`1/rank`, scaled) |
+| `B` | Budget — max number of representatives to select |
 
 ### Decision Variables
+
 | Symbol | Description |
 |--------|-------------|
-| `x[i] ∈ {0, 1}` | 1 if word i is selected as a representative |
-| `y[j] ∈ {0, 1}` | 1 if word j is covered by at least one selected word |
+| `x_v ∈ {0, 1}` | 1 if word v is selected as representative |
+| `y_wv ∈ {0, 1}` | 1 if word w is assigned to representative v |
 
 ### Model
 
 ```
-maximize    Σ_j  y[j]
+minimize    Σ_w Σ_v  F_w · D[w][v] · y_wv              (weighted distance)
 
-subject to  y[j]  ≤  Σ_{i ∈ N(j)}  x[i]     ∀ j ∈ W   (coverage constraint)
-            Σ_i  x[i]  ≤  B                              (budget constraint)
-            x[i], y[j]  ∈  {0, 1}                        (binary)
+subject to  Σ_v  y_wv  =  1           ∀ w ∈ W          (each word assigned to one rep)
+            y_wv  ≤  x_v              ∀ w, v ∈ W        (assign only to selected reps)
+            Σ_v  x_v  ≤  B                              (budget)
+            x_v, y_wv  ∈  {0, 1}      ∀ w, v ∈ W        (binary)
 ```
 
-**Problem class:** Binary Integer Programming (BIP) — NP-hard in general.
+**Problem class:** Binary Integer Programming (BIP) — weighted p-Median (facility location).
+NP-hard in general; Gurobi solves it to proven optimality on our 100-word instance (0.15 sec).
 
 ---
 
 ## Data Pipeline
 
 ```
-top-10k word list
-      │
-      ▼
-select 100 words  ──────────────────►  data/words_100.csv
-      │
-      ▼
-load GloVe/Word2Vec embeddings
-      │
-      ▼
-compute pairwise cosine distances  ──► data/distance_matrix.csv  (100×100)
+data/pop10000.xlsx
+(Popülerlik Sırası, Kelime)
+         │
+         ▼
+stratified sample → 100 words     ──►  data/words_100.csv
+(10 bands × 10 words, seed=42)         columns: rank, word, freq_weight
+         │
+         ▼
+GloVe 6B 100d embeddings
+         │
+         ▼
+pairwise cosine distances          ──►  data/distance_matrix.csv  (100×100)
 ```
-
-Run `data/prepare_data.py` to reproduce this pipeline.
 
 ---
 
@@ -78,15 +78,15 @@ Run `data/prepare_data.py` to reproduce this pipeline.
 ```
 set_covering_mathematical_optimization/
 ├── data/
-│   ├── prepare_data.py        # Data preparation pipeline
-│   ├── words_100.csv          # 100-word subset with frequency ranks
-│   └── distance_matrix.csv   # 100×100 semantic distance matrix
-├── report/                    # LaTeX source files (minipaper)
-│   ├── minipaper.tex
-│   └── ...
+│   ├── prepare_data.py        # Runs the full data pipeline
+│   ├── words_100.csv          # 100-word subset  (rank, word, freq_weight)
+│   ├── distance_matrix.csv   # 100×100 cosine distance matrix
+│   └── glove.6B.100d.txt     # GloVe file — download separately (not in git)
+├── report/
+│   └── minipaper.tex          # LaTeX source for the mini paper
 ├── results/
-│   └── solution.txt           # Solver output (generated)
-├── model.py                   # Gurobi ILP implementation
+│   └── solution.txt           # Solver output (generated by model.py)
+├── model.py                   # Gurobi ILP — FWMCP implementation
 ├── model.lp                   # Exported LP file (generated by model.py)
 ├── gurobi.log                 # Gurobi solver log (generated by model.py)
 ├── README.md                  # This file
@@ -98,65 +98,74 @@ set_covering_mathematical_optimization/
 
 ## How to Run
 
-### 1. Install Requirements
+### 0. Install dependencies
 
 ```bash
-pip install gurobipy numpy pandas gensim
+pip install gurobipy numpy pandas openpyxl
 ```
 
-> You also need a valid **Gurobi license**. Free academic licenses are available at [gurobi.com](https://www.gurobi.com/academia/academic-program-and-licenses/).
+> A valid **Gurobi license** is required.
+> Free academic licenses: [gurobi.com/academia](https://www.gurobi.com/academia/academic-program-and-licenses/)
 
-### 2. Prepare Data
+### 1. Download GloVe embeddings
+
+Download [glove.6B.zip](https://nlp.stanford.edu/projects/glove/) and extract `glove.6B.100d.txt` into the `data/` directory.
+
+### 2. Prepare data
 
 ```bash
 python data/prepare_data.py
 ```
 
-This generates:
-- `data/words_100.csv` — the 100-word subset
-- `data/distance_matrix.csv` — the 100×100 distance matrix
+Generates `data/words_100.csv` and `data/distance_matrix.csv`.
 
-### 3. Run the Optimization Model
+### 3. Solve the model
 
 ```bash
+# Default (B=10)
 python model.py
+
+# Custom budget
+python model.py --budget 15
+
+# Sensitivity analysis — sweep B in {5, 10, 15, 20}
+python model.py --sweep
 ```
 
-This produces:
-- `model.lp` — the exported Gurobi LP file
-- `gurobi.log` — the solver log
-- `results/solution.txt` — the optimal solution
-
-### 4. Inspect Results
-
-Open `results/solution.txt` to see:
-- Which words were selected (x[i] = 1)
-- Which words are covered (y[j] = 1)
-- Total coverage count
-- Objective value
+Outputs: `model.lp`, `gurobi.log`, `results/solution.txt`.
 
 ---
 
 ## Configuration
 
-Edit the top of `model.py` to change parameters:
+Edit the constant at the top of `model.py`:
 
 ```python
-BUDGET = 10            # Number of words to select (B)
-COVERAGE_RADIUS = 0.3  # Distance threshold for coverage (r)
+BUDGET = 10    # B : number of representative words to select
 ```
+
+Or pass it as a CLI argument: `python model.py --budget 15`
 
 ---
 
 ## Requirements
 
-| Dependency | Version | Purpose |
-|------------|---------|---------|
+| Package | Version | Purpose |
+|---------|---------|---------|
 | Python | 3.9+ | Runtime |
 | gurobipy | 10.x+ | ILP solver |
-| numpy | 1.24+ | Numerical computation |
+| numpy | 1.24+ | Numerical operations |
 | pandas | 2.0+ | Data I/O |
-| gensim | 4.x+ | Word2Vec / GloVe loading |
+| openpyxl | 3.x+ | Read pop10000.xlsx source file |
+
+---
+
+## References
+
+- Nemhauser, G. L., Wolsey, L. A., & Fisher, M. L. (1978). An analysis of approximations for maximizing submodular set functions. *Mathematical Programming*, 14(1), 265–294.
+- Hochbaum, D. S. (1997). *Approximation Algorithms for NP-Hard Problems*. PWS Publishing.
+- Pennington, J., Socher, R., & Manning, C. D. (2014). GloVe: Global Vectors for Word Representation. *EMNLP 2014*.
+- Speer, R. (2022). wordfreq. https://github.com/rspeer/wordfreq
 
 ---
 
@@ -164,11 +173,3 @@ COVERAGE_RADIUS = 0.3  # Distance threshold for coverage (r)
 
 Hacettepe University — Department of Industrial Engineering
 EMÜ414 Mathematical Programming and Computer Applications, Spring 2025–2026
-
----
-
-## References
-
-- Hochbaum, D. S. (1997). Approximation algorithms for NP-hard problems. PWS Publishing.
-- Pennington, J., Socher, R., & Manning, C. D. (2014). GloVe: Global Vectors for Word Representation.
-- Gurobi Optimizer Reference Manual. Gurobi Optimization, LLC.

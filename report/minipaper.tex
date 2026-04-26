@@ -1,0 +1,294 @@
+\documentclass[11pt]{article}
+
+\usepackage{comment}
+\usepackage{algorithmicx}
+\usepackage{amstext,amssymb,amsfonts,latexsym,amsmath,amscd,amsthm}
+\usepackage{subfig}
+\usepackage[export]{adjustbox}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage[round]{natbib}
+\usepackage{booktabs}
+\usepackage{lscape}
+\usepackage{verbatim}
+\usepackage{array}
+\usepackage{setspace}
+\usepackage{appendix}
+\usepackage{palatino}
+\usepackage{algcompatible}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xurl}
+\usepackage{color}
+\usepackage{rotating}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{ulem}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{observation}{Observation}
+\newtheorem{definition}{Definition}
+
+\algrenewcommand\algorithmicrequire{\textbf{Input:}}
+\algrenewcommand\algorithmicensure{\textbf{Output:}}
+
+\usepackage[
+  pdfauthor={},
+  pdftitle={Vocabulary Covering Optimization},
+  pdfstartview=XYZ,
+  bookmarks=true,
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue,
+  pdftex,
+  linktocpage=true,
+  hyperindex=true
+]{hyperref}
+
+\usepackage{tikz}
+\usetikzlibrary{arrows}
+\usepackage{enumerate}
+\usepackage{caption}
+\bibliographystyle{apalike}
+
+\textwidth = 6.5 in
+\textheight = 9 in
+\topmargin = -0.5 in
+\evensidemargin = 0 in
+\oddsidemargin = 0 in
+\parskip = 0.1 in
+\parindent = 0 in
+\tabcolsep = 5 pt
+
+\DeclareMathOperator{\rank}{rank}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\title{\textbf{Frequency-Weighted p-Median\\
+       on Semantic Word Space}\\[6pt]
+       {\large EMÜ414 -- Mathematical Programming and Computer Applications\\
+        Hacettepe University, Department of Industrial Engineering\\
+        Spring 2025--2026}}
+
+\author{[Team Name]\\[4pt]
+        [Member 1] \quad [Member 2] \quad [Member 3]\\
+        [Member 4] \quad [Member 5] \quad [Member 6]}
+
+\date{May 2026}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Vocabulary selection is a fundamental problem in language learning and natural language
+processing. Given a large lexicon, a learner or system with limited capacity must choose
+which words to focus on so that the chosen set represents the broader vocabulary as well
+as possible. More frequent words are inherently more valuable to cover, since they appear
+more often in real text.
+
+In this project, we model vocabulary selection as a \textit{Frequency-Weighted p-Median Problem} (FWPMP) over a semantic word space. We take the 100 most
+representative words drawn from the top 10{,}000 most frequent English words, build a
+pairwise semantic distance matrix using pre-trained GloVe word embeddings, and select
+a budget-constrained set of \emph{representative words} that minimises the total
+frequency-weighted semantic distance between every word and its assigned representative.
+
+The problem belongs to the class of \textbf{Binary Integer Programming (BIP)} problems.
+It generalises the classical $p$-Median facility location problem to a weighted semantic
+setting, and is known to be NP-hard \citep{hochbaum1997}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Problem Statement}\label{sec:problem}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Informal Description}
+
+We are given a set of $|W| = 100$ English words. Each word $w$ has a known usage
+frequency weight $F_w$, derived from its rank in the top-10k English frequency list.
+A pairwise semantic distance $D_{wv}$ is defined for every pair $(w, v)$ using the
+cosine distance between GloVe embedding vectors.
+
+We select at most $B$ words as \emph{representatives} and assign every remaining
+word to exactly one representative. The goal is to minimise the total
+frequency-weighted semantic distance between words and their assigned representatives
+--- equivalently, to bring the most-used words as close as possible to a representative.
+
+\subsection{Mathematical Formulation}\label{sec:model}
+
+\subsubsection*{Notation}
+
+\begin{table}[h]
+\caption{Mathematical Notation}
+\label{tab:notation}
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{ll}
+\toprule
+\textbf{Symbol} & \textbf{Description} \\
+\midrule
+\multicolumn{2}{l}{\textit{Sets}} \\
+$W$ & Set of words, $|W| = 100$, indexed by $w$ and $v$ \\[4pt]
+\multicolumn{2}{l}{\textit{Parameters}} \\
+$D_{wv} \in [0,2]$ & Semantic cosine distance between word $w$ and word $v$ \\
+$F_{w} \in \mathbb{R}_{+}$ & Frequency weight of word $w$ (higher = more frequent) \\
+$B \in \mathbb{Z}_{+}$ & Budget: maximum number of representatives to select \\[4pt]
+\multicolumn{2}{l}{\textit{Decision Variables}} \\
+$x_{v} \in \{0,1\}$ & $1$ if word $v$ is selected as a representative, $0$ otherwise \\
+$y_{wv} \in \{0,1\}$ & $1$ if word $w$ is assigned to representative $v$, $0$ otherwise \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection*{Integer Programming Model}
+
+\begin{alignat}{3}
+    &\underset{}{\text{minimize}}\; & &
+    \sum_{w \in W}\sum_{v \in W} F_{w} \cdot D_{wv} \cdot y_{wv}
+    \label{eq:obj} \\[6pt]
+    &\text{subject to} \notag \\
+    & & & \sum_{v \in W} y_{wv} \;=\; 1
+    \qquad \forall\, w \in W
+    \label{eq:assign} \\
+    & & & y_{wv} \;\leq\; x_{v}
+    \qquad \forall\, w, v \in W
+    \label{eq:link} \\
+    & & & \sum_{v \in W} x_{v} \;\leq\; B
+    \label{eq:budget} \\
+    & & & x_{v},\; y_{wv} \;\in\; \{0,1\}
+    \qquad \forall\, w, v \in W
+    \label{eq:binary}
+\end{alignat}
+
+\paragraph{Objective \eqref{eq:obj}.}
+Minimise the total frequency-weighted semantic distance summed over all
+word-to-representative assignments. A high-frequency word ($F_w$ large) assigned
+far from its representative ($D_{wv}$ large) incurs a large cost, so the model
+prioritises placing popular words close to a selected representative.
+
+\paragraph{Assignment constraints \eqref{eq:assign}.}
+Every word must be assigned to exactly one representative.
+Since $D_{ww} = 0$, a selected word is always assigned to itself at zero cost.
+
+\paragraph{Linking constraints \eqref{eq:link}.}
+A word $w$ can only be assigned to word $v$ if $v$ has been selected as a
+representative ($x_v = 1$).
+
+\paragraph{Budget constraint \eqref{eq:budget}.}
+At most $B$ words may be selected as representatives.
+
+\paragraph{Binary constraints \eqref{eq:binary}.}
+All decision variables are binary.
+
+\subsubsection*{Problem Classification}
+
+The model is a \textbf{Binary Integer Program (BIP)}.  It is an instance of the
+weighted $p$-Median facility location problem, which is NP-hard in general
+\citep{hochbaum1997}.
+The distance matrix $D$ enters the objective directly, so the
+actual semantic distances --- not merely a coverage threshold --- drive the solution.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Data}\label{sec:data}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Word Selection}
+
+We start from the top 10{,}000 most frequent English words as ranked by the
+\texttt{wordfreq} corpus \citep{speer2022}.
+To ensure a diverse semantic spread, we divide the list into 10 frequency bands
+of 1{,}000 words each and sample 10 words uniformly at random from each band
+(random seed = 42). This stratified procedure yields a subset of 100 words that
+spans both very common ($\text{rank} \leq 1000$) and moderately common
+($\text{rank} \leq 10{,}000$) vocabulary.
+
+\subsection{Frequency Weights}
+
+Each word $w$ with frequency rank $\rho_w$ is assigned the weight
+\begin{equation}
+    F_w = \frac{1}{\rho_w},
+    \label{eq:weight}
+\end{equation}
+so higher-frequency words have larger weights. Weights are normalised to
+$[0,1]$ by dividing by $\max_w F_w = F_{\text{rank}=1}$.
+
+\subsection{Semantic Distance Matrix}
+
+Word embeddings are obtained from the pre-trained GloVe model with
+100-dimensional vectors trained on the 6B-token Wikipedia and Gigaword corpus
+\citep{pennington2014}.
+The semantic distance between words $w$ and $v$ is defined as the cosine distance
+\begin{equation}
+    D_{wv} = 1 - \frac{\mathbf{e}_w \cdot \mathbf{e}_v}
+                      {\|\mathbf{e}_w\|\,\|\mathbf{e}_v\|},
+    \label{eq:dist}
+\end{equation}
+where $\mathbf{e}_w \in \mathbb{R}^{100}$ is the GloVe embedding of word $w$.
+The resulting $100 \times 100$ distance matrix $D$ is symmetric with zeros on
+the diagonal and values in $[0, 2]$.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Computational Results}\label{sec:results}
+% ─────────────────────────────────────────────────────────────────────────────
+
+[To be completed after running model.py]
+
+Experiments are conducted with varying values of the budget $B \in \{5, 10, 15, 20\}$.
+The model is solved to proven optimality using Gurobi 13.x on a standard laptop.
+For each value of $B$, we report the optimal objective value (total frequency-weighted
+distance) and the average distance per word assignment.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Sensitivity Analysis}\label{sec:sensitivity}
+% ─────────────────────────────────────────────────────────────────────────────
+
+[To be completed]
+
+We analyse:
+\begin{itemize}
+    \item Effect of budget $B$ on total frequency-weighted distance (objective value).
+    \item Diminishing returns: how much does each additional representative reduce cost?
+    \item Assignment clusters: which words group together under the same representative,
+          and does the clustering reflect semantic similarity?
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}\label{sec:conclusion}
+% ─────────────────────────────────────────────────────────────────────────────
+
+[To be completed]
+
+% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{apalike}
+\begin{thebibliography}{9}
+
+\bibitem{hochbaum1997}
+Hochbaum, D.~S. (1997).
+\newblock \emph{Approximation Algorithms for NP-Hard Problems}.
+\newblock PWS Publishing.
+
+\bibitem{nemhauser1978}
+Nemhauser, G.~L., Wolsey, L.~A., and Fisher, M.~L. (1978).
+\newblock An analysis of approximations for maximizing submodular set functions.
+\newblock \emph{Mathematical Programming}, 14(1):265--294.
+
+\bibitem{pennington2014}
+Pennington, J., Socher, R., and Manning, C.~D. (2014).
+\newblock Gloʋe: Global vectors for word representation.
+\newblock In \emph{Proceedings of EMNLP}, pages 1532--1543.
+
+\bibitem{speer2022}
+Speer, R. (2022).
+\newblock \texttt{wordfreq}: Access a database of word frequencies, in multiple languages.
+\newblock \url{https://github.com/rspeer/wordfreq}.
+
+\end{thebibliography}
+
+\end{document}

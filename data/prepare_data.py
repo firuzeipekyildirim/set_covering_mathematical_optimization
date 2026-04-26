@@ -4,153 +4,249 @@ EMU414 - Mathematical Programming and Computer Applications
 Hacettepe University, Spring 2025-2026
 
 Steps:
-  1. Load a top-10k English word frequency list
-  2. Select 100 words (stratified by frequency band)
-  3. Load pre-trained GloVe embeddings (glove.6B.100d.txt)
-  4. Compute pairwise cosine distance matrix
-  5. Save words_100.csv and distance_matrix.csv
+  1. Load top-10k English word list from  data/pop10000.xlsx
+       columns: 'Popülerlik Sırası' (rank)  and  'Kelime' (word)
+  2. Select 100 words via stratified sampling across 10 frequency bands
+  3. Compute frequency weight F_w = 1/rank  (normalised to [0,1])
+  4. Load pre-trained GloVe embeddings  (glove.6B.100d.txt)
+  5. Compute 100×100 pairwise cosine distance matrix
+  6. Save data/words_100.csv  and  data/distance_matrix.csv
 
 Requirements:
-  - glove.6B.100d.txt in the data/ directory
-    Download: https://nlp.stanford.edu/projects/glove/
-  - pip install numpy pandas
+  pip install numpy pandas openpyxl
+
+  GloVe file (glove.6B.100d.txt) — place in the data/ directory:
+  Download: https://nlp.stanford.edu/projects/glove/  → glove.6B.zip
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Configuration
-# ---------------------------------------------------------------------------
-TOP_K = 10000               # size of the source word list
-N_WORDS = 100               # words to select for the problem instance
-N_BANDS = 10                # stratified sampling: N_WORDS / N_BANDS per band
+# ─────────────────────────────────────────────────────────────────────────────
+TOP_K       = 10_000    # source vocabulary size
+N_WORDS     = 100       # words to select for the problem instance
+N_BANDS     = 10        # stratified bands  →  N_WORDS/N_BANDS per band
 RANDOM_SEED = 42
 
-GLOVE_FILE = os.path.join(os.path.dirname(__file__), "glove.6B.100d.txt")
-OUT_WORDS = os.path.join(os.path.dirname(__file__), "words_100.csv")
-OUT_DIST = os.path.join(os.path.dirname(__file__), "distance_matrix.csv")
+HERE          = os.path.dirname(os.path.abspath(__file__))
+SOURCE_FILE   = os.path.join(HERE, "pop10000.xlsx")   # ← local data source
+GLOVE_FILE    = os.path.join(HERE, "glove.6B.100d.txt")
+OUT_WORDS     = os.path.join(HERE, "words_100.csv")
+OUT_DIST      = os.path.join(HERE, "distance_matrix.csv")
 
 
-def load_top10k_words():
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1 — Top-10k word list  (from pop10000.xlsx)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_top10k() -> list[tuple[int, str]]:
     """
-    Returns a list of (rank, word) for the top TOP_K English words.
-
-    We use a simple built-in frequency list derived from common corpora.
-    Replace this with your own source list if preferred (e.g., wordfreq library).
+    Reads data/pop10000.xlsx.
+    Expected columns: 'Popülerlik Sırası' (rank int) and 'Kelime' (word str).
+    Returns [(rank, word), ...] sorted by rank ascending, length == TOP_K.
     """
-    try:
-        from wordfreq import top_n_list
-        words = top_n_list("en", TOP_K)
-        return [(i + 1, w) for i, w in enumerate(words)]
-    except ImportError:
-        pass
+    if not os.path.exists(SOURCE_FILE):
+        sys.exit(
+            f"[ERROR] Source file not found: {SOURCE_FILE}\n"
+            "  Place pop10000.xlsx in the data/ directory."
+        )
 
-    # Fallback: load from a plain text file (one word per line, most frequent first)
-    fallback_path = os.path.join(os.path.dirname(__file__), "top10k_words.txt")
-    if os.path.exists(fallback_path):
-        with open(fallback_path, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-        return [(i + 1, w) for i, w in enumerate(lines[:TOP_K])]
+    df = pd.read_excel(SOURCE_FILE, engine="openpyxl")
 
-    raise FileNotFoundError(
-        "Could not find a top-10k word source. Either install wordfreq "
-        "(pip install wordfreq) or place top10k_words.txt in the data/ directory."
-    )
+    # Normalise column names (strip whitespace)
+    df.columns = [c.strip() for c in df.columns]
+
+    rank_col = "Popülerlik Sırası"
+    word_col = "Kelime"
+
+    if rank_col not in df.columns or word_col not in df.columns:
+        sys.exit(
+            f"[ERROR] Expected columns '{rank_col}' and '{word_col}' in pop10000.xlsx.\n"
+            f"  Found: {df.columns.tolist()}"
+        )
+
+    df = df[[rank_col, word_col]].dropna()
+    df[rank_col] = df[rank_col].astype(int)
+    df = df.sort_values(rank_col).reset_index(drop=True)
+    df = df.head(TOP_K)
+
+    word_list = list(zip(df[rank_col].tolist(), df[word_col].astype(str).tolist()))
+    print(f"  Source: pop10000.xlsx  ({len(word_list)} words loaded)")
+    return word_list
 
 
-def select_words(word_list, n=N_WORDS, n_bands=N_BANDS, seed=RANDOM_SEED):
-    """Stratified sampling: sample n/n_bands words from each frequency band."""
-    rng = np.random.default_rng(seed)
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2 — Stratified word selection
+# ─────────────────────────────────────────────────────────────────────────────
+def select_words(word_list: list[tuple[int, str]],
+                 n: int = N_WORDS,
+                 n_bands: int = N_BANDS,
+                 seed: int = RANDOM_SEED) -> list[tuple[int, str]]:
+    """
+    Divide word_list into n_bands equal frequency bands.
+    Sample n/n_bands words uniformly from each band.
+    Returns list of (rank, word) tuples, length == n.
+    """
+    rng       = np.random.default_rng(seed)
     band_size = len(word_list) // n_bands
-    per_band = n // n_bands
-    selected = []
+    per_band  = n // n_bands
+    selected  = []
+
     for b in range(n_bands):
-        band = word_list[b * band_size: (b + 1) * band_size]
-        chosen = rng.choice(len(band), size=per_band, replace=False)
-        for idx in sorted(chosen):
-            selected.append(band[idx])
+        band   = word_list[b * band_size : (b + 1) * band_size]
+        idxs   = rng.choice(len(band), size=per_band, replace=False)
+        for i in sorted(idxs):
+            selected.append(band[i])
+
     return selected[:n]
 
 
-def load_glove(path, vocab):
-    """Load GloVe vectors for the given vocabulary. Returns {word: np.array}."""
-    vocab_set = set(vocab)
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3 — Frequency weights   F_w = 1/rank,  normalised to [0,1]
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_weights(ranks: list[int]) -> list[float]:
+    """
+    F_w = 1 / rank  →  normalised so that the highest-rank word has weight 1.
+    Words with rank 1 (most frequent) get F = 1.0.
+    """
+    raw    = [1.0 / r for r in ranks]
+    max_fw = max(raw)
+    return [fw / max_fw for fw in raw]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4 — Embeddings  (GloVe if available, else character n-gram TF-IDF)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_glove(path: str, vocab: set[str]) -> dict[str, np.ndarray]:
+    """Parse GloVe text file; return {word: vector} for words in vocab."""
     embeddings = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             parts = line.rstrip().split(" ")
-            word = parts[0]
-            if word in vocab_set:
+            word  = parts[0]
+            if word in vocab:
                 embeddings[word] = np.array(parts[1:], dtype=np.float32)
     return embeddings
 
 
-def cosine_distance(a, b):
-    """Cosine distance = 1 - cosine_similarity. Range [0, 2]."""
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 1.0
-    return 1.0 - float(np.dot(a, b) / (norm_a * norm_b))
+def ngram_embeddings(words: list[str]) -> dict[str, np.ndarray]:
+    """
+    Fallback when GloVe is unavailable.
+    Represent each word as a character n-gram TF-IDF vector (sklearn).
+    Captures orthographic + morphological similarity — no download needed.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
+    mat = vec.fit_transform(words).toarray().astype(np.float32)
+    return {w: mat[i] for i, w in enumerate(words)}
 
 
-def build_distance_matrix(words, embeddings):
-    """Build the N×N cosine distance matrix. Missing words get zero vector."""
-    n = len(words)
-    dim = next(iter(embeddings.values())).shape[0]
-    vecs = np.array([embeddings.get(w, np.zeros(dim)) for w in words])
+def get_embeddings(words: list[str]) -> tuple[dict[str, np.ndarray], str]:
+    """
+    Return (embeddings_dict, source_label).
+    Tries GloVe first; falls back to character n-gram TF-IDF.
+    """
+    if os.path.exists(GLOVE_FILE):
+        print(f"  Source: GloVe  ({GLOVE_FILE})")
+        emb = load_glove(GLOVE_FILE, set(words))
+        missing = [w for w in words if w not in emb]
+        if missing:
+            print(f"  [WARN] {len(missing)} words missing from GloVe → zero vector")
+        return emb, "GloVe 6B 100d"
+    else:
+        print("  [INFO] GloVe file not found — using character n-gram TF-IDF (sklearn)")
+        print("         (To use GloVe later: place glove.6B.100d.txt in the data/ folder)")
+        return ngram_embeddings(words), "char n-gram TF-IDF (2-4)"
 
-    # Normalize rows for fast cosine distance
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 5 — Cosine distance matrix
+# ─────────────────────────────────────────────────────────────────────────────
+def build_distance_matrix(words: list[str],
+                           embeddings: dict[str, np.ndarray]) -> np.ndarray:
+    """
+    N×N cosine distance matrix.
+    D_wv = 1 - cosine_similarity(e_w, e_v)  in [0, 2].
+    Words missing from embeddings dict get a zero vector.
+    """
+    dim  = next(iter(embeddings.values())).shape[0]
+    vecs = np.array([embeddings.get(w, np.zeros(dim)) for w in words],
+                    dtype=np.float32)
+
+    norms     = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms     = np.where(norms == 0, 1.0, norms)
     vecs_norm = vecs / norms
 
-    # Cosine similarity matrix, then convert to distance
-    sim = vecs_norm @ vecs_norm.T
+    sim  = vecs_norm @ vecs_norm.T
     dist = 1.0 - sim
     np.fill_diagonal(dist, 0.0)
-    return dist
+    return dist.astype(np.float64)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    print("Step 1: Loading top-10k word list...")
-    word_list = load_top10k_words()
-    print(f"  Loaded {len(word_list)} words.")
+    print("=" * 60)
+    print("  DATA PREPARATION PIPELINE")
+    print("=" * 60)
 
-    print(f"Step 2: Selecting {N_WORDS} words (stratified, seed={RANDOM_SEED})...")
+    # ── Step 1 ───────────────────────────────────────────────────────────────
+    print("\nStep 1 | Loading top-10k word list ...")
+    word_list = load_top10k()
+    print(f"         {len(word_list)} words loaded.")
+
+    # ── Step 2 ───────────────────────────────────────────────────────────────
+    print(f"\nStep 2 | Stratified sampling  "
+          f"({N_BANDS} bands × {N_WORDS // N_BANDS} words, seed={RANDOM_SEED}) ...")
     selected = select_words(word_list)
-    ranks = [r for r, w in selected]
-    words = [w for r, w in selected]
-    print(f"  Selected: {words[:5]} ... (and {len(words)-5} more)")
+    ranks    = [r for r, _ in selected]
+    words    = [w for _, w in selected]
+    print(f"         Selected {len(words)} words.")
+    print(f"         Sample: {words[:8]} ...")
 
-    print("Step 3: Loading GloVe embeddings...")
-    if not os.path.exists(GLOVE_FILE):
-        raise FileNotFoundError(
-            f"GloVe file not found: {GLOVE_FILE}\n"
-            "Download glove.6B.zip from https://nlp.stanford.edu/projects/glove/ "
-            "and extract glove.6B.100d.txt into the data/ directory."
-        )
-    embeddings = load_glove(GLOVE_FILE, words)
-    coverage = sum(1 for w in words if w in embeddings)
-    print(f"  Found embeddings for {coverage}/{N_WORDS} words.")
+    # ── Step 3 ───────────────────────────────────────────────────────────────
+    print("\nStep 3 | Computing frequency weights  F_w = (1/rank) / max(1/rank) ...")
+    freq_weights = compute_weights(ranks)
+    print(f"         Weight range: [{min(freq_weights):.6f}, {max(freq_weights):.6f}]")
 
-    print("Step 4: Computing cosine distance matrix...")
+    # ── Step 4 ───────────────────────────────────────────────────────────────
+    print(f"\nStep 4 | Loading word embeddings ...")
+    embeddings, emb_source = get_embeddings(words)
+    found = sum(1 for w in words if w in embeddings)
+    print(f"         Embedding source : {emb_source}")
+    print(f"         Vectors found    : {found}/{N_WORDS}")
+
+    # ── Step 5 ───────────────────────────────────────────────────────────────
+    print("\nStep 5 | Computing 100×100 cosine distance matrix ...")
     dist = build_distance_matrix(words, embeddings)
-    print(f"  Distance matrix shape: {dist.shape}")
-    print(f"  Min distance: {dist[dist > 0].min():.4f}, Max: {dist.max():.4f}")
+    print(f"         Shape: {dist.shape}")
+    nonzero = dist[dist > 0]
+    print(f"         Distance range (excl. diagonal): "
+          f"[{nonzero.min():.4f}, {nonzero.max():.4f}]")
+    print(f"         Mean distance: {nonzero.mean():.4f}")
 
-    print("Step 5: Saving output files...")
-    words_df = pd.DataFrame({"rank": ranks, "word": words})
+    # ── Step 6 — Save ────────────────────────────────────────────────────────
+    print("\nStep 6 | Saving output files ...")
+
+    words_df = pd.DataFrame({
+        "rank":         ranks,
+        "word":         words,
+        "freq_weight":  freq_weights,
+    })
     words_df.to_csv(OUT_WORDS, index=False)
-    print(f"  Saved: {OUT_WORDS}")
+    print(f"         Saved: words_100.csv  ({len(words_df)} rows)")
 
     dist_df = pd.DataFrame(dist, index=words, columns=words)
     dist_df.to_csv(OUT_DIST)
-    print(f"  Saved: {OUT_DIST}")
+    print(f"         Saved: distance_matrix.csv  ({dist.shape[0]}x{dist.shape[1]})")
 
-    print("\nDone. You can now run model.py.")
+    print("\n" + "=" * 60)
+    print("  Done. You can now run model.py.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

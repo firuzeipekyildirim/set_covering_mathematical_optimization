@@ -1,124 +1,254 @@
 """
-Maximum Coverage Problem on Semantic Word Space
+Frequency-Weighted p-Median on Semantic Word Space
 EMU414 - Mathematical Programming and Computer Applications
 Hacettepe University, Spring 2025-2026
 
-Model:
-    maximize    sum_j y[j]
-    s.t.        y[j] <= sum_{i in N(j)} x[i]    for all j  (coverage)
-                sum_i x[i] <= BUDGET                        (budget)
-                x[i], y[j] in {0, 1}                        (binary)
+Model  (Weighted p-Median):
+    minimize    sum_{w in W} sum_{v in W}  F_w * D_wv * y_wv
 
-where N(j) = {i : d[i][j] <= COVERAGE_RADIUS}
+    s.t.
+        sum_{v in W}  y_wv  =  1           for all w in W   [assignment]
+        y_wv  <=  x_v                       for all w,v      [linking]
+        sum_{v in W}  x_v   <=  B                            [budget]
+        x_v, y_wv  in  {0,1}               for all w,v      [binary]
+
+Interpretation:
+    - x_v = 1  →  word v is selected as a representative
+    - y_wv = 1  →  word w is assigned to representative v
+    - Every word is assigned to exactly one representative (its nearest selected word)
+    - F_w weights by frequency: frequent words penalised more if assigned far away
+    - D_wv is the semantic cosine distance between words w and v
+
+Inputs  (from data/):
+    words_100.csv        columns: rank, word, freq_weight
+    distance_matrix.csv  100x100 cosine-distance matrix  (index = word)
+
+Outputs:
+    model.lp             Gurobi LP export
+    gurobi.log           Gurobi solver log
+    results/solution.txt human-readable solution
 """
 
 import os
+import sys
 import pandas as pd
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 
-# ---------------------------------------------------------------------------
-# Parameters — edit these to change the problem instance
-# ---------------------------------------------------------------------------
-BUDGET = 10             # B: number of representative words to select
-COVERAGE_RADIUS = 0.3   # r: cosine distance threshold for coverage
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+BUDGET      = 10        # B : number of representative words to select
 
-DATA_DIR = "data"
+DATA_DIR    = "data"
 RESULTS_DIR = "results"
-WORDS_FILE = os.path.join(DATA_DIR, "words_100.csv")
-DISTANCE_FILE = os.path.join(DATA_DIR, "distance_matrix.csv")
+WORDS_FILE  = os.path.join(DATA_DIR, "words_100.csv")
+DIST_FILE   = os.path.join(DATA_DIR, "distance_matrix.csv")
+LP_FILE     = "model.lp"
+LOG_FILE    = "gurobi.log"
+RESULT_FILE = os.path.join(RESULTS_DIR, "solution.txt")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Data loading
+# ─────────────────────────────────────────────────────────────────────────────
 def load_data():
+    if not os.path.exists(WORDS_FILE):
+        sys.exit(f"[ERROR] {WORDS_FILE} not found. Run data/prepare_data.py first.")
+    if not os.path.exists(DIST_FILE):
+        sys.exit(f"[ERROR] {DIST_FILE} not found. Run data/prepare_data.py first.")
+
     words_df = pd.read_csv(WORDS_FILE)
-    words = words_df["word"].tolist()
+    words    = words_df["word"].tolist()
+    weights  = words_df["freq_weight"].tolist()   # F_w
 
-    dist_df = pd.read_csv(DISTANCE_FILE, index_col=0)
-    dist = dist_df.values  # numpy array, shape (100, 100)
+    dist_df  = pd.read_csv(DIST_FILE, index_col=0)
+    dist     = dist_df.values.astype(float)       # 100x100 numpy array
 
-    return words, dist
+    assert len(words) == dist.shape[0] == dist.shape[1], \
+        "Mismatch between word list and distance matrix dimensions."
 
-
-def build_neighborhoods(dist, r):
-    """N[j] = list of indices i such that d[i][j] <= r"""
-    n = dist.shape[0]
-    neighborhoods = {}
-    for j in range(n):
-        neighborhoods[j] = [i for i in range(n) if dist[i][j] <= r]
-    return neighborhoods
+    return words, weights, dist
 
 
-def run_model(words, dist):
+# ─────────────────────────────────────────────────────────────────────────────
+# Gurobi model  —  Weighted p-Median
+# ─────────────────────────────────────────────────────────────────────────────
+def build_and_solve(words, weights, dist):
     n = len(words)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    neighborhoods = build_neighborhoods(dist, COVERAGE_RADIUS)
+    model = gp.Model("pMedian_Words")
+    model.setParam("LogFile", LOG_FILE)
 
-    model = gp.Model("MaxCoverage_Words")
-    model.setParam("LogFile", "gurobi.log")
+    # ── Decision variables ──────────────────────────────────────────────────
+    # x[v]    = 1  if word v is selected as representative
+    # y[w, v] = 1  if word w is assigned to representative v
+    x = model.addVars(n,    vtype=GRB.BINARY, name="x")
+    y = model.addVars(n, n, vtype=GRB.BINARY, name="y")
 
-    # Decision variables
-    x = model.addVars(n, vtype=GRB.BINARY, name="x")  # select word i
-    y = model.addVars(n, vtype=GRB.BINARY, name="y")  # word j is covered
+    # ── Objective: minimize frequency-weighted total distance ────────────────
+    #   min  Σ_w Σ_v  F_w * D_wv * y_wv
+    model.setObjective(
+        gp.quicksum(
+            weights[w] * dist[w, v] * y[w, v]
+            for w in range(n)
+            for v in range(n)
+        ),
+        GRB.MINIMIZE
+    )
 
-    # Objective: maximize total coverage
-    model.setObjective(gp.quicksum(y[j] for j in range(n)), GRB.MAXIMIZE)
+    # ── Constraint 1  (Assignment) ──────────────────────────────────────────
+    #   Σ_v y_wv = 1   ∀w  →  every word assigned to exactly one representative
+    for w in range(n):
+        model.addConstr(
+            gp.quicksum(y[w, v] for v in range(n)) == 1,
+            name=f"assign_{w}"
+        )
 
-    # Coverage constraints: y[j] can be 1 only if some x[i] in N(j) is 1
-    for j in range(n):
-        if neighborhoods[j]:
-            model.addConstr(
-                y[j] <= gp.quicksum(x[i] for i in neighborhoods[j]),
-                name=f"cover_{j}"
-            )
-        else:
-            # No word can cover j — force y[j] = 0
-            model.addConstr(y[j] == 0, name=f"cover_{j}_empty")
+    # ── Constraint 2  (Linking) ─────────────────────────────────────────────
+    #   y_wv ≤ x_v   ∀w,v  →  can only assign to a selected representative
+    for w in range(n):
+        for v in range(n):
+            model.addConstr(y[w, v] <= x[v], name=f"link_{w}_{v}")
 
-    # Budget constraint
-    model.addConstr(gp.quicksum(x[i] for i in range(n)) <= BUDGET, name="budget")
+    # ── Constraint 3  (Budget) ──────────────────────────────────────────────
+    model.addConstr(
+        gp.quicksum(x[v] for v in range(n)) <= BUDGET,
+        name="budget"
+    )
 
-    # Export LP formulation
-    model.write("model.lp")
+    # ── Export LP  ──────────────────────────────────────────────────────────
+    model.write(LP_FILE)
 
+    # ── Solve  ──────────────────────────────────────────────────────────────
     model.optimize()
 
-    # Write results
-    write_results(model, words, x, y, n)
+    return model, x, y, n
 
 
-def write_results(model, words, x, y, n):
-    result_path = os.path.join(RESULTS_DIR, "solution.txt")
-    with open(result_path, "w") as f:
-        f.write("=" * 60 + "\n")
-        f.write("MAXIMUM COVERAGE PROBLEM — SOLUTION\n")
-        f.write("=" * 60 + "\n\n")
+# ─────────────────────────────────────────────────────────────────────────────
+# Results
+# ─────────────────────────────────────────────────────────────────────────────
+def write_results(model, words, weights, dist, x, y, n):
+    if model.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT):
+        print(f"[WARN] Solver status: {model.Status}. No feasible solution.")
+        return
 
-        if model.Status == GRB.OPTIMAL:
-            f.write(f"Status        : OPTIMAL\n")
+    status_str = "OPTIMAL" if model.Status == GRB.OPTIMAL else "TIME LIMIT"
+
+    # Selected representatives
+    reps = [v for v in range(n) if x[v].X > 0.5]
+
+    # Assignment: word w → representative v
+    assignments = {}
+    for w in range(n):
+        for v in range(n):
+            if y[w, v].X > 0.5:
+                assignments[w] = v
+                break
+
+    # Objective breakdown
+    total_weighted_dist = model.ObjVal
+    max_possible_dist   = sum(weights)   # if every word assigned to distance=1 rep
+
+    lines = [
+        "=" * 65,
+        "  FREQUENCY-WEIGHTED p-MEDIAN — SOLUTION",
+        "=" * 65,
+        f"  Status                   : {status_str}",
+        f"  Objective (min weighted dist) : {total_weighted_dist:.6f}",
+        f"  Budget (B)               : {BUDGET}",
+        "=" * 65,
+        "",
+        f"SELECTED REPRESENTATIVES ({len(reps)}):",
+    ]
+
+    for v in reps:
+        lines.append(f"  [{v:3d}]  {words[v]:<25}  (freq_weight = {weights[v]:.4f})")
+
+    lines += ["", f"ASSIGNMENTS  (word  ->  representative  |  distance):"]
+    for w in range(n):
+        v   = assignments.get(w, -1)
+        rep = words[v] if v >= 0 else "???"
+        d   = dist[w, v] if v >= 0 else -1
+        marker = " (self)" if w == v else ""
+        lines.append(
+            f"  {words[w]:<25}  ->  {rep:<25}  d={d:.4f}{marker}"
+        )
+
+    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print("\n".join(lines))
+    print(f"\n[INFO] Results saved to: {RESULT_FILE}")
+    print(f"[INFO] LP file saved to: {LP_FILE}")
+    print(f"[INFO] Log saved to:     {LOG_FILE}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sensitivity sweep  (optional, --sweep flag)
+# ─────────────────────────────────────────────────────────────────────────────
+def sensitivity_sweep(words, weights, dist, budgets=(5, 10, 15, 20)):
+    """Run model for each budget value; report total weighted distance."""
+    n = len(words)
+    print("\n" + "=" * 55)
+    print("  SENSITIVITY ANALYSIS  (budget sweep)")
+    print("=" * 55)
+    print(f"  {'B':>4}   {'Obj (min dist)':>16}   {'Avg dist/word':>14}")
+    print("-" * 55)
+
+    for B in budgets:
+        m = gp.Model()
+        m.setParam("OutputFlag", 0)
+        x = m.addVars(n,    vtype=GRB.BINARY)
+        y = m.addVars(n, n, vtype=GRB.BINARY)
+        m.setObjective(
+            gp.quicksum(weights[w] * dist[w, v] * y[w, v]
+                        for w in range(n) for v in range(n)),
+            GRB.MINIMIZE
+        )
+        for w in range(n):
+            m.addConstr(gp.quicksum(y[w, v] for v in range(n)) == 1)
+        for w in range(n):
+            for v in range(n):
+                m.addConstr(y[w, v] <= x[v])
+        m.addConstr(gp.quicksum(x[v] for v in range(n)) <= B)
+        m.optimize()
+
+        if m.Status == GRB.OPTIMAL:
+            print(f"  {B:>4}   {m.ObjVal:>16.6f}   {m.ObjVal/n:>14.6f}")
         else:
-            f.write(f"Status        : {model.Status}\n")
+            print(f"  {B:>4}   {'N/A':>16}")
 
-        f.write(f"Objective     : {model.ObjVal:.0f} words covered\n")
-        f.write(f"Budget (B)    : {BUDGET}\n")
-        f.write(f"Radius (r)    : {COVERAGE_RADIUS}\n\n")
-
-        selected = [words[i] for i in range(n) if x[i].X > 0.5]
-        covered = [words[j] for j in range(n) if y[j].X > 0.5]
-
-        f.write(f"Selected words ({len(selected)}):\n")
-        for w in selected:
-            f.write(f"  {w}\n")
-
-        f.write(f"\nCovered words ({len(covered)} / {n} = "
-                f"{100*len(covered)/n:.1f}%):\n")
-        for w in covered:
-            f.write(f"  {w}\n")
-
-    print(f"\nResults written to {result_path}")
+    print("=" * 55)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    words, dist = load_data()
-    run_model(words, dist)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Frequency-Weighted p-Median on semantic word space."
+    )
+    parser.add_argument("--budget", type=int, default=BUDGET,
+                        help=f"Budget B (default: {BUDGET})")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Run sensitivity sweep over different budgets")
+    args = parser.parse_args()
+
+    BUDGET = args.budget
+
+    print("[INFO] Loading data ...")
+    words, weights, dist = load_data()
+    print(f"[INFO] {len(words)} words loaded.")
+
+    if args.sweep:
+        sensitivity_sweep(words, weights, dist)
+    else:
+        print(f"[INFO] Solving p-Median  (B={BUDGET}) ...")
+        model, x, y, n = build_and_solve(words, weights, dist)
+        write_results(model, words, weights, dist, x, y, n)
