@@ -4,19 +4,26 @@ EMU414 - Mathematical Programming and Computer Applications
 Hacettepe University, Spring 2025-2026
 
 Model (Weighted p-Median):
-    minimize    sum_{w in W} sum_{v in W}  F_w * D_wv * y_wv
+    minimize    sum_{w in W} sum_{v in N(w)}  F_w * D_wv * y_wv
 
     s.t.
-        sum_{v in W}  y_wv  =  1           for all w in W   [assignment]
-        y_wv  <=  x_v                       for all w,v      [linking]
-        sum_{v in W}  x_v   <=  B                            [budget]
-        x_v, y_wv  in  {0,1}               for all w,v      [binary]
+        sum_{v in N(w)}  y_wv  =  1           for all w in W   [assignment]
+        y_wv  <=  x_v                          for all w,v      [linking]
+        sum_{v not in known}  x_v   <=  B                       [budget]
+        x_v  =  1                              for all v in known [known]
+        x_v, y_wv  in  {0,1}                  for all w,v      [binary]
+
+    N(w): if |W| > SparseThreshold, only the KNeighbors nearest words
+          plus TopPopular most frequent words plus known words;
+          otherwise all words.
 
 Inputs:
     data/input.xlsx
         Sheet "Words"      : columns rank, word  (frequency-sorted)
         Sheet "Parameters" : columns Parameter, Value
-                             rows: Budget, MIPGap, TimeLimit
+                             rows: Budget, MIPGap, TimeLimit,
+                                   SparseThreshold, KNeighbors, TopPopular
+        Sheet "KnownWords" : single column of pre-learnt words (optional)
     data/dolma_300_2024_1.2M.100_combined.txt
         GloVe-format 300-dim embeddings
 
@@ -24,6 +31,7 @@ Outputs:
     model.lp              Gurobi LP export
     gurobi.log            Gurobi solver log
     results/solution.txt  human-readable solution
+    <input>_solution.xlsx solution Excel
 """
 
 import os
@@ -64,22 +72,25 @@ def load_excel(path):
         if key not in params:
             sys.exit(f"[ERROR] Sheet 'Parameters' missing row: {key}")
 
-    words   = words_df["word"].astype(str).tolist()
-    ranks   = words_df["rank"].astype(float).tolist()
-    budget  = int(params["Budget"])
-    mipgap  = float(params["MIPGap"])
-    tlimit  = float(params["TimeLimit"])
+    words    = words_df["word"].astype(str).tolist()
+    ranks    = words_df["rank"].astype(float).tolist()
+    budget   = int(params["Budget"])
+    mipgap   = float(params["MIPGap"])
+    tlimit   = float(params["TimeLimit"])
+    sp_thresh = int(params.get("SparseThreshold", 2000))
+    k_neighbors = int(params.get("KNeighbors", 200))
+    top_popular = int(params.get("TopPopular", 10))
 
     weights = compute_freq_weights(ranks)
 
-    xl      = pd.ExcelFile(path)
+    xl = pd.ExcelFile(path)
     if "KnownWords" in xl.sheet_names:
         kw_df       = pd.read_excel(path, sheet_name="KnownWords")
         known_words = kw_df.iloc[:, 0].dropna().astype(str).tolist()
     else:
         known_words = []
 
-    return words, weights, budget, mipgap, tlimit, known_words
+    return words, weights, budget, mipgap, tlimit, known_words, sp_thresh, k_neighbors, top_popular
 
 
 def compute_freq_weights(ranks):
@@ -98,8 +109,8 @@ def load_embeddings(path, words):
             f"        Extract the .txt file into the data/ directory."
         )
 
-    needed  = set(words)
-    found   = {}
+    needed = set(words)
+    found  = {}
 
     print(f"[INFO] Scanning embeddings for {len(needed)} words ...")
     with open(path, "r", encoding="utf-8") as f:
@@ -120,36 +131,62 @@ def load_embeddings(path, words):
     return found
 
 
-def build_distance_matrix(words, embeddings):
+def build_neighbor_structure(words, embeddings, known_indices, sp_thresh, k_neighbors, top_popular):
+    """
+    Returns V (n, dim), neighbors[w] (array of valid rep indices), dist_rows[w] (parallel distances).
+    When n > sp_thresh, restricts each word's candidates to its k_neighbors nearest
+    + top_popular most frequent + known_indices. Otherwise all words are candidates.
+    """
     n    = len(words)
-    vecs = []
-    for w in words:
-        if w in embeddings:
-            vecs.append(embeddings[w])
-        else:
-            vecs.append(np.zeros(next(iter(embeddings.values())).shape[0], dtype=np.float32))
-    V = np.stack(vecs)   # (n, dim)
+    zero = np.zeros(next(iter(embeddings.values())).shape[0], dtype=np.float32) if embeddings else np.zeros(300, dtype=np.float32)
+    V    = np.stack([embeddings.get(w, zero) for w in words])
 
-    # L2 distance: ||v_i - v_j||_2
-    diff = V[:, None, :] - V[None, :, :]   # (n, n, dim)
-    dist = np.sqrt((diff ** 2).sum(axis=-1))   # (n, n)
-    return dist
+    if n <= sp_thresh:
+        diff         = V[:, None, :] - V[None, :, :]
+        dist_matrix  = np.sqrt((diff ** 2).sum(axis=-1))
+        neighbors    = [np.arange(n, dtype=np.int32) for _ in range(n)]
+        dist_rows    = [dist_matrix[w] for w in range(n)]
+        print(f"[INFO] Full distance matrix ({n}x{n}).")
+    else:
+        always = set(range(min(top_popular, n))) | known_indices
+        neighbors = [None] * n
+        dist_rows  = [None] * n
+        chunk = 512
+        print(f"[INFO] Sparse mode: {k_neighbors} nearest + {top_popular} popular + {len(known_indices)} known per word.")
+        for start in range(0, n, chunk):
+            end   = min(start + chunk, n)
+            block = V[start:end]                                           # (B, dim)
+            dists = np.sqrt(((block[:, None, :] - V[None, :, :]) ** 2).sum(axis=2))  # (B, n)
+            for i, w in enumerate(range(start, end)):
+                nearest  = set(np.argsort(dists[i])[:k_neighbors])
+                valid    = sorted(nearest | always)
+                neighbors[w] = np.array(valid, dtype=np.int32)
+                dist_rows[w] = dists[i, valid].astype(np.float64)
+        print(f"[INFO] Sparse neighbor structure built.")
+
+    return V, neighbors, dist_rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gurobi model  —  Weighted p-Median
 # ─────────────────────────────────────────────────────────────────────────────
-def build_and_solve(words, weights, dist, budget, mipgap, tlimit, known_indices):
+def build_and_solve(words, weights, neighbors, dist_rows, budget, mipgap, tlimit, known_indices):
     n = len(words)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     model = gp.Model("pMedian_Words")
-    model.setParam("LogFile", LOG_FILE)
-    model.setParam("MIPGap",  mipgap)
+    model.setParam("LogFile",   LOG_FILE)
+    model.setParam("MIPGap",    mipgap)
     model.setParam("TimeLimit", tlimit)
 
-    x = model.addVars(n,    vtype=GRB.BINARY, name="x")
-    y = model.addVars(n, n, vtype=GRB.BINARY, name="y")
+    x = model.addVars(n, vtype=GRB.BINARY, name="x")
+
+    # Sparse y: only create variables for valid (w, v) pairs
+    y = {}
+    for w in range(n):
+        for v in neighbors[w].tolist():
+            y[w, v] = model.addVar(vtype=GRB.BINARY, name=f"y_{w}_{v}")
+    model.update()
 
     # Force known words to be selected as representatives
     for v in known_indices:
@@ -157,29 +194,26 @@ def build_and_solve(words, weights, dist, budget, mipgap, tlimit, known_indices)
 
     model.setObjective(
         gp.quicksum(
-            weights[w] * dist[w, v] * y[w, v]
+            weights[w] * float(dist_rows[w][i]) * y[w, int(neighbors[w][i])]
             for w in range(n)
-            for v in range(n)
+            for i in range(len(neighbors[w]))
         ),
         GRB.MINIMIZE
     )
 
     for w in range(n):
         model.addConstr(
-            gp.quicksum(y[w, v] for v in range(n)) == 1,
+            gp.quicksum(y[w, int(v)] for v in neighbors[w]) == 1,
             name=f"assign_{w}"
         )
 
     for w in range(n):
-        for v in range(n):
+        for v in neighbors[w].tolist():
             model.addConstr(y[w, v] <= x[v], name=f"link_{w}_{v}")
 
     # Known words do not count toward budget
-    free_indices = [v for v in range(n) if v not in known_indices]
-    model.addConstr(
-        gp.quicksum(x[v] for v in free_indices) <= budget,
-        name="budget"
-    )
+    free = [v for v in range(n) if v not in known_indices]
+    model.addConstr(gp.quicksum(x[v] for v in free) <= budget, name="budget")
 
     model.write(LP_FILE)
     model.optimize()
@@ -190,7 +224,7 @@ def build_and_solve(words, weights, dist, budget, mipgap, tlimit, known_indices)
 # ─────────────────────────────────────────────────────────────────────────────
 # Results
 # ─────────────────────────────────────────────────────────────────────────────
-def write_results(model, words, weights, dist, x, y, n, budget, input_file):
+def write_results(model, words, weights, V, neighbors, x, y, n, budget, input_file):
     if model.Status not in (GRB.OPTIMAL, GRB.TIME_LIMIT):
         print(f"[WARN] Solver status: {model.Status}. No feasible solution.")
         return
@@ -201,7 +235,7 @@ def write_results(model, words, weights, dist, x, y, n, budget, input_file):
 
     assignments = {}
     for w in range(n):
-        for v in range(n):
+        for v in neighbors[w].tolist():
             if y[w, v].X > 0.5:
                 assignments[w] = v
                 break
@@ -226,7 +260,7 @@ def write_results(model, words, weights, dist, x, y, n, budget, input_file):
     for w in range(n):
         v      = assignments.get(w, -1)
         rep    = words[v] if v >= 0 else "???"
-        d      = dist[w, v] if v >= 0 else -1.0
+        d      = float(np.linalg.norm(V[w] - V[v])) if v >= 0 else -1.0
         marker = " (self)" if w == v else ""
         assignment_lines.append(
             f"  {words[w]:<25}  ->  {rep:<25}  d={d:.4f}{marker}"
@@ -239,8 +273,8 @@ def write_results(model, words, weights, dist, x, y, n, budget, input_file):
     print("\n".join(summary))
 
     solution_path = write_solution_excel(
-        model, words, weights, dist, reps, assignments, n, budget,
-        status_str, total_weighted_dist, input_file
+        model, words, weights, V, reps, assignments,
+        n, budget, status_str, total_weighted_dist, input_file
     )
 
     print(f"\n[INFO] Solution Excel  : {solution_path}")
@@ -249,13 +283,11 @@ def write_results(model, words, weights, dist, x, y, n, budget, input_file):
     print(f"[INFO] Gurobi log      : {LOG_FILE}")
 
 
-def write_solution_excel(model, words, weights, dist, reps, assignments,
+def write_solution_excel(model, words, weights, V, reps, assignments,
                          n, budget, status_str, obj_val, input_file):
-    import openpyxl
     from openpyxl import load_workbook
 
     out_path = os.path.splitext(input_file)[0] + "_solution.xlsx"
-
     wb = load_workbook(input_file)
 
     # ── Sheet: Representatives ───────────────────────────────────────────────
@@ -268,11 +300,10 @@ def write_solution_excel(model, words, weights, dist, reps, assignments,
     ws_asgn = wb.create_sheet("Assignments")
     ws_asgn.append(["Word", "Freq_Weight", "Representative", "L2_Distance", "Is_Self"])
     for w in range(n):
-        v    = assignments.get(w, -1)
-        rep  = words[v] if v >= 0 else ""
-        d    = round(float(dist[w, v]), 6) if v >= 0 else ""
-        self = (w == v)
-        ws_asgn.append([words[w], round(weights[w], 6), rep, d, self])
+        v   = assignments.get(w, -1)
+        rep = words[v] if v >= 0 else ""
+        d   = round(float(np.linalg.norm(V[w] - V[v])), 6) if v >= 0 else ""
+        ws_asgn.append([words[w], round(weights[w], 6), rep, d, w == v])
 
     # ── Sheet: Solver ────────────────────────────────────────────────────────
     ws_solv = wb.create_sheet("Solver")
@@ -293,15 +324,13 @@ def write_solution_excel(model, words, weights, dist, reps, assignments,
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-
     args       = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags      = {a for a in sys.argv[1:] if a.startswith("--")}
     input_file = args[0] if args else EXCEL_FILE
     uniform    = "--uniform" in flags
 
     print("[INFO] Loading Excel ...")
-    words, weights, budget, mipgap, tlimit, known_words = load_excel(input_file)
+    words, weights, budget, mipgap, tlimit, known_words, sp_thresh, k_neighbors, top_popular = load_excel(input_file)
     if uniform:
         weights = [1.0] * len(words)
         print("[INFO] --uniform flag set: all freq_weights = 1")
@@ -317,9 +346,12 @@ if __name__ == "__main__":
     print(f"[INFO] {len(words)} words | B={budget} | known={len(known_indices)} | MIPGap={mipgap} | TimeLimit={tlimit}s")
 
     embeddings = load_embeddings(EMBED_FILE, words)
-    dist       = build_distance_matrix(words, embeddings)
-    print(f"[INFO] Distance matrix built ({dist.shape[0]}x{dist.shape[1]}, L2).")
+    V, neighbors, dist_rows = build_neighbor_structure(
+        words, embeddings, known_indices, sp_thresh, k_neighbors, top_popular
+    )
 
     print(f"[INFO] Solving p-Median (B={budget}) ...")
-    model, x, y, n = build_and_solve(words, weights, dist, budget, mipgap, tlimit, known_indices)
-    write_results(model, words, weights, dist, x, y, n, budget, input_file)
+    model, x, y, n = build_and_solve(
+        words, weights, neighbors, dist_rows, budget, mipgap, tlimit, known_indices
+    )
+    write_results(model, words, weights, V, neighbors, x, y, n, budget, input_file)
