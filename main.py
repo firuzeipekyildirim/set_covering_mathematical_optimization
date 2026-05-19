@@ -97,7 +97,7 @@ def compute_freq_weights(ranks):
     """Compute normalised frequency weights from rank list. Modify here to change weighting scheme."""
     raw   = [1.0 / r for r in ranks]
     max_w = max(raw)
-    return [(w / max_w) ** 1.1 for w in raw]
+    return [(w / max_w) for w in raw]
 
 
 def load_embeddings(path, words):
